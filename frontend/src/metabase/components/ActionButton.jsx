@@ -142,7 +142,13 @@ export default class ActionButton extends Component {
       >
         {active ? (
           // TODO: loading spinner
-          activeText
+          // activeText
+          <div className="Loading spread flex flex-column layout-centered text-brand z2">
+            <LoadingSpinner />
+            <h2 className="Loading-message text-brand text-uppercase my3">
+              Updating data...
+            </h2>
+          </div>
         ) : result === "success" ? (
           <span>
             {forceActiveStyle ? null : <Icon name="check" size={12} />}

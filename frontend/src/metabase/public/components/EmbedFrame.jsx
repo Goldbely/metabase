@@ -115,7 +115,7 @@ export default class EmbedFrame extends Component {
           })}
         >
           {actionButtons || (parameters && parameters.length > 0) ? (
-            <div className="EmbedFrame-header flex align-center p1 sm-p2 lg-p3">
+            <div className="EmbedFrame-header flex align-center">
               {actionButtons && (
                 <div className="flex-align-left text-grey-3">
                   {actionButtons}

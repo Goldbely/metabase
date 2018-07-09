@@ -2,7 +2,8 @@
   --night-mode-color: rgba(255, 255, 255, 0.86);
 }
 .Dashboard {
-  background-color: #f9fbfc;
+  /* background-color: #f9fbfc; */
+  background-color: #fff;
   min-height: 100vh;
 }
 

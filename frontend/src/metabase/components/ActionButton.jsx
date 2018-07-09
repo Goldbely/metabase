@@ -5,6 +5,7 @@ import PropTypes from "prop-types";
 
 import Icon from "metabase/components/Icon";
 import Button from "metabase/components/Button";
+import LoadingSpinner from "metabase/components/LoadingSpinner.jsx";
 
 import { cancelable } from "metabase/lib/promise";
 import { t } from "c-3po";
@@ -15,7 +16,6 @@ type Props = {
   className?: string,
   children?: any,
   normalText?: string,
-  activeText?: string,
   failedText?: string,
   successText?: string,
   forceActiveStyle?: boolean,
@@ -49,7 +49,6 @@ export default class ActionButton extends Component {
   static defaultProps = {
     className: "Button",
     normalText: t`Save`,
-    activeText: t`Saving...`,
     failedText: t`Save failed`,
     successText: t`Saved`,
     forceActiveStyle: false,
@@ -114,7 +113,6 @@ export default class ActionButton extends Component {
   render() {
     const {
       normalText,
-      activeText,
       failedText,
       successText,
       // eslint-disable-next-line no-unused-vars
@@ -141,8 +139,6 @@ export default class ActionButton extends Component {
         onClick={this.onClick}
       >
         {active ? (
-          // TODO: loading spinner
-          // activeText
           <div className="Loading spread flex flex-column layout-centered text-brand z2">
             <LoadingSpinner />
             <h2 className="Loading-message text-brand text-uppercase my3">

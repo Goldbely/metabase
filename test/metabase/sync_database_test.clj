@@ -4,19 +4,19 @@
 
   Your new tests almost certainly do not belong in this namespace. Please put them in ones mirroring the location of
   the specific part of sync you're testing."
-  (:require [expectations :refer :all]
+  (:require [clojure.test :refer :all]
             [metabase
              [driver :as driver]
              [sync :as sync]
+             [test :as mt]
              [util :as u]]
             [metabase.models
              [database :refer [Database]]
              [field :refer [Field]]
              [table :refer [Table]]]
-            [metabase.test.mock.util :as mock-util]
+            [metabase.test.mock.util :as mock.u]
             [metabase.test.util :as tu]
-            [toucan.db :as db]
-            [toucan.util.test :as tt]))
+            [toucan.db :as db]))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                        End-to-end 'MovieDB' Sync Tests                                         |
@@ -25,7 +25,7 @@
 ;; These tests make up a fake driver and then confirm that sync uses the various methods defined by the driver to
 ;; correctly sync appropriate metadata rows (Table/Field/etc.) in the Application DB
 
-(def ^:private ^:const sync-test-tables
+(def ^:private sync-test-tables
   {"movie"  {:name   "movie"
              :schema "default"
              :fields #{{:name          "id"
@@ -49,48 +49,41 @@
                         :database-type "VARCHAR"
                         :base-type     :type/Text}}}})
 
+(driver/register! ::sync-test, :abstract? true)
 
-;; TODO - I'm 90% sure we could just reüse the "MovieDB" instead of having this subset of it used here
-(defrecord SyncTestDriver []
-  :load-ns true
-  clojure.lang.Named
-  (getName [_] "SyncTestDriver"))
-
-
-(defn- describe-database [& _]
+(defmethod driver/describe-database ::sync-test
+  [& _]
   {:tables (set (for [table (vals sync-test-tables)]
                   (dissoc table :fields)))})
 
-(defn- describe-table [_ _ table]
+(defmethod driver/describe-table ::sync-test
+  [_ _ table]
   (get sync-test-tables (:name table)))
 
-(defn- describe-table-fks [_ _ table]
+(defmethod driver/describe-table-fks ::sync-test
+  [_ _ table]
   (set (when (= "movie" (:name table))
          #{{:fk-column-name   "studio"
             :dest-table       {:name   "studio"
                                :schema nil}
             :dest-column-name "studio"}})))
 
-(extend SyncTestDriver
-  driver/IDriver
-  (merge driver/IDriverDefaultsMixin
-         {:describe-database        describe-database
-          :describe-table           describe-table
-          :describe-table-fks       describe-table-fks
-          :features                 (constantly #{:foreign-keys})
-          :details-fields           (constantly [])
-          :process-query-in-context mock-util/process-query-in-context}))
+(defmethod driver/supports? [::sync-test :foreign-keys]
+  [_ _]
+  true)
 
+(defmethod driver/mbql->native ::sync-test
+  [_ query]
+  query)
 
-(driver/register-driver! :sync-test (SyncTestDriver.))
-
+(defmethod driver/execute-reducible-query ::sync-test
+  [_ query _ respond]
+  (mock.u/mock-execute-reducible-query query respond))
 
 (defn- table-details [table]
   (into {} (-> (dissoc table :db :pk_field :field_values)
                (assoc :fields (for [field (db/select Field, :table_id (:id table), {:order-by [:name]})]
-                                (into {} (-> (dissoc field
-                                                     :table :db :children :qualified-name :qualified-name-components
-                                                     :values :target)
+                                (into {} (-> field
                                              (update :fingerprint map?)
                                              (update :fingerprint_version (complement zero?))))))
                tu/boolean-ids-and-timestamps)))
@@ -130,85 +123,91 @@
    :special_type        nil
    :table_id            true
    :updated_at          true
-   :visibility_type     :normal})
+   :visibility_type     :normal
+   :settings            nil})
 
-;; ## SYNC DATABASE
-(expect
-  [(merge table-defaults
-          {:schema       "default"
-           :name         "movie"
-           :display_name "Movie"
-           :fields       [(merge field-defaults
-                                 {:name          "id"
-                                  :display_name  "ID"
-                                  :database_type "SERIAL"
-                                  :base_type     :type/Integer
-                                  :special_type  :type/PK})
-                          (merge field-defaults
-                                 {:name               "studio"
-                                  :display_name       "Studio"
-                                  :database_type      "VARCHAR"
-                                  :base_type          :type/Text
-                                  :fk_target_field_id true
-                                  :special_type       :type/FK})
-                          (merge field-defaults
-                                 {:name          "title"
-                                  :display_name  "Title"
-                                  :database_type "VARCHAR"
-                                  :base_type     :type/Text
-                                  :special_type  :type/Title})]})
-   (merge table-defaults
-          {:name         "studio"
-           :display_name "Studio"
-           :fields       [(merge field-defaults
-                                 {:name          "name"
-                                  :display_name  "Name"
-                                  :database_type "VARCHAR"
-                                  :base_type     :type/Text})
-                          (merge field-defaults
-                                 {:name          "studio"
-                                  :display_name  "Studio"
-                                  :database_type "VARCHAR"
-                                  :base_type     :type/Text
-                                  :special_type  :type/PK})]})]
-  (tt/with-temp Database [db {:engine :sync-test}]
+(def ^:private field-defaults-with-fingerprint
+  (assoc field-defaults
+    :last_analyzed       true
+    :fingerprint_version true
+    :fingerprint         true))
+
+(def ^:private field:movie-id
+  (merge
+   field-defaults
+   {:name          "id"
+    :display_name  "ID"
+    :database_type "SERIAL"
+    :base_type     :type/Integer
+    :special_type  :type/PK}))
+
+(def ^:private field:movie-studio
+  (merge
+   field-defaults-with-fingerprint
+   {:name               "studio"
+    :display_name       "Studio"
+    :database_type      "VARCHAR"
+    :base_type          :type/Text
+    :fk_target_field_id true
+    :special_type       :type/FK}))
+
+(def ^:private field:movie-title
+  (merge
+   field-defaults-with-fingerprint
+   {:name          "title"
+    :display_name  "Title"
+    :database_type "VARCHAR"
+    :base_type     :type/Text
+    :special_type  :type/Title}))
+
+(def ^:private field:studio-name
+  (merge
+   field-defaults-with-fingerprint
+   {:name          "name"
+    :display_name  "Name"
+    :database_type "VARCHAR"
+    :base_type     :type/Text
+    :special_type  :type/Name}))
+
+;; `studio.studio`? huh?
+(def ^:private field:studio-studio
+  (merge
+   field-defaults
+   {:name          "studio"
+    :display_name  "Studio"
+    :database_type "VARCHAR"
+    :base_type     :type/Text
+    :special_type  :type/PK}))
+
+(deftest sync-database-test
+  (mt/with-temp Database [db {:engine :metabase.sync-database-test/sync-test}]
     (sync/sync-database! db)
-    ;; we are purposely running the sync twice to test for possible logic issues which only manifest on resync of a
-    ;; database, such as adding tables that already exist or duplicating fields
     (sync/sync-database! db)
-    (mapv table-details (db/select Table, :db_id (u/get-id db), {:order-by [:name]}))))
+    (let [[movie studio] (mapv table-details (db/select Table :db_id (u/get-id db) {:order-by [:name]}))]
+      (is (= (merge table-defaults {:schema       "default"
+                                    :name         "movie"
+                                    :display_name "Movie"
+                                    :fields       [field:movie-id field:movie-studio field:movie-title]})
+             movie))
+      (is (= (merge table-defaults {:name         "studio"
+                                    :display_name "Studio"
+                                    :fields       [field:studio-name field:studio-studio]})
+             studio)))))
 
 
-;; ## SYNC TABLE
-
-(expect
-  (merge table-defaults
-         {:schema       "default"
-          :name         "movie"
-          :display_name "Movie"
-          :fields       [(merge field-defaults
-                                {:name          "id"
-                                 :display_name  "ID"
-                                 :database_type "SERIAL"
-                                 :base_type     :type/Integer
-                                 :special_type  :type/PK})
-                         (merge field-defaults
-                                {:name          "studio"
-                                 :display_name  "Studio"
-                                 :database_type "VARCHAR"
-                                 :base_type     :type/Text})
-                         (merge field-defaults
-                                {:name          "title"
-                                 :display_name  "Title"
-                                 :database_type "VARCHAR"
-                                 :base_type     :type/Text
-                                 :special_type  :type/Title})]})
-  (tt/with-temp* [Database [db    {:engine :sync-test}]
-                  Table    [table {:name   "movie"
-                                   :schema "default"
-                                   :db_id  (u/get-id db)}]]
+(deftest sync-table-test
+  (mt/with-temp* [Database [db {:engine :metabase.sync-database-test/sync-test}]
+                  Table    [table {:name "movie", :schema "default", :db_id (u/get-id db)}]]
     (sync/sync-table! table)
-    (table-details (Table (:id table)))))
+    (is (= (merge
+            table-defaults
+            {:schema       "default"
+             :name         "movie"
+             :display_name "Movie"
+             :fields       [field:movie-id
+                            (assoc field:movie-studio :fk_target_field_id false :special_type nil)
+                            field:movie-title]})
+           (table-details (Table (:id table)))))))
 
 
 ;; !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

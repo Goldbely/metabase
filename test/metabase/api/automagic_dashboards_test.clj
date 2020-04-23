@@ -8,28 +8,38 @@
              [permissions :as perms]
              [permissions-group :as perms-group]
              [segment :refer [Segment]]]
+            [metabase.query-processor :as qp]
             [metabase.test
              [automagic-dashboards :refer :all]
              [data :as data]
+             [domain-entities :as de.test]
+             [transforms :as transforms.test]
              [util :as tu]]
             [metabase.test.data.users :as test-users]
+            [metabase.transforms
+             [core :as transforms]
+             [materialize :as transforms.materialize]
+             [specs :as transforms.specs]]
             [toucan.util.test :as tt]))
 
 (defn- api-call
   ([template args] (api-call template args (constantly true)))
-  ([template args revoke-fn]
-   (with-rasta
+  ([template args revoke-fn] (api-call template args revoke-fn some?))
+  ([template args revoke-fn validation-fn]
+   (test-users/with-test-user :rasta
      (with-dashboard-cleanup
-       (let [api-endpoint (apply format (str "automagic-dashboards/" template) args)]
-         (and (some? ((test-users/user->client :rasta) :get 200 api-endpoint))
-              (try
-                (do
-                  (perms/revoke-permissions! (perms-group/all-users) (data/id))
-                  (revoke-fn)
-                  (= ((test-users/user->client :rasta) :get 403 api-endpoint)
-                     "You don't have permissions to do that."))
-                (finally
-                  (perms/grant-permissions! (perms-group/all-users) (perms/object-path (data/id)))))))))))
+       (let [api-endpoint (apply format (str "automagic-dashboards/" template) args)
+             result       (validation-fn ((test-users/user->client :rasta) :get 200 api-endpoint))]
+         (when (and result
+                    (try
+                      (do
+                        (perms/revoke-permissions! (perms-group/all-users) (data/id))
+                        (revoke-fn)
+                        (= ((test-users/user->client :rasta) :get 403 api-endpoint)
+                           "You don't have permissions to do that."))
+                      (finally
+                        (perms/grant-permissions! (perms-group/all-users) (perms/object-path (data/id))))))
+           result))))))
 
 
 ;;; ------------------- X-ray  -------------------
@@ -130,21 +140,23 @@
 
 ;;; ------------------- Comparisons -------------------
 
-(def ^:private segment {:table_id (data/id :venues)
-                        :definition {:filter [:> [:field-id (data/id :venues :price)] 10]}})
+(def ^:private segment
+  (delay
+   {:table_id   (data/id :venues)
+    :definition {:filter [:> [:field-id (data/id :venues :price)] 10]}}))
 
 (expect
-  (tt/with-temp* [Segment [{segment-id :id} segment]]
+  (tt/with-temp* [Segment [{segment-id :id} @segment]]
     (api-call "table/%s/compare/segment/%s"
               [(data/id :venues) segment-id])))
 
 (expect
-  (tt/with-temp* [Segment [{segment-id :id} segment]]
+  (tt/with-temp* [Segment [{segment-id :id} @segment]]
     (api-call "table/%s/rule/example/indepth/compare/segment/%s"
               [(data/id :venues) segment-id])))
 
 (expect
-  (tt/with-temp* [Segment [{segment-id :id} segment]]
+  (tt/with-temp* [Segment [{segment-id :id} @segment]]
     (api-call "adhoc/%s/cell/%s/compare/segment/%s"
               [(->> {:query {:filter [:> [:field-id (data/id :venues :price)] 10]
                              :source-table (data/id :venues)}
@@ -154,3 +166,29 @@
                (->> [:= [:field-id (data/id :venues :price)] 15]
                     (#'magic/encode-base64-json))
                segment-id])))
+
+
+;;; ------------------- Transforms -------------------
+
+(expect
+  [[4 1 10.0646 -165.374 "Red Medicine" 3 1.5 4 3 2 1]
+   [11 2 34.0996 -118.329 "Stout Burgers & Beers" 2 2.0 11 2 1 1]
+   [11 3 34.0406 -118.428 "The Apple Pan" 2 2.0 11 2 1 1]]
+  (test-users/with-test-user :rasta
+    (transforms.test/with-test-transform-specs
+      (de.test/with-test-domain-entity-specs
+        (tu/with-model-cleanup ['Card 'Collection]
+          (transforms/apply-transform! (data/id) "PUBLIC" (first @transforms.specs/transform-specs))
+          (api-call "transform/%s" ["Test transform"]
+                    #(revoke-collection-permissions!
+                      (transforms.materialize/get-collection "Test transform"))
+                    (fn [dashboard]
+                      (->> dashboard
+                           :ordered_cards
+                           (sort-by (juxt :row :col))
+                           last
+                           :card
+                           :dataset_query
+                           qp/process-query
+                           :data
+                           :rows))))))))

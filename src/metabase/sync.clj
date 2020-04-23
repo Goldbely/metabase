@@ -12,15 +12,16 @@
              [analyze :as analyze]
              [field-values :as field-values]
              [interface :as i]
-             [sync-metadata :as sync-metadata]]
-            [schema.core :as s]
-            [metabase.sync.util :as sync-util]))
+             [sync-metadata :as sync-metadata]
+             [util :as sync-util]]
+            [schema.core :as s]))
 
 (s/defn sync-database!
-  "Perform all the different sync operations synchronously for DATABASE.
-   This is considered a 'full sync' in that all the different sync operations are performed at the same time.
-   Please note that this function is *not* what is called by the scheduled tasks. Those call different steps
-   independently."
+  "Perform all the different sync operations synchronously for `database`.
+
+  This is considered a 'full sync' in that all the different sync operations are performed at consecutively. Please
+  note that this function is *not* what is called by the scheduled tasks; those call different steps independently.
+  This function is called when a Database is first added."
   {:style/indent 1}
   [database :- i/DatabaseInstance]
   (sync-util/sync-operation :sync database (format "Sync %s" (sync-util/name-for-logging database))
@@ -33,7 +34,7 @@
 
 
 (s/defn sync-table!
-  "Perform all the different sync operations synchronously for a given TABLE."
+  "Perform all the different sync operations synchronously for a given `table`."
   [table :- i/TableInstance]
   (sync-metadata/sync-table-metadata! table)
   (analyze/analyze-table! table)

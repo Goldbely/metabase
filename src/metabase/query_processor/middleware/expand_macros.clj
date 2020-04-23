@@ -7,26 +7,18 @@
    TODO - this namespace is ancient and written with MBQL '95 in mind, e.g. it is case-sensitive.
    At some point this ought to be reworked to be case-insensitive and cleaned up."
   (:require [clojure.tools.logging :as log]
-            [metabase.mbql.util :as mbql.u]
+            [metabase.mbql
+             [schema :as mbql.s]
+             [util :as mbql.u]]
             [metabase.models
              [metric :refer [Metric]]
              [segment :refer [Segment]]]
-            [metabase.query-processor
-             [interface :as i]
-             [util :as qputil]]
             [metabase.util :as u]
-            [puppetlabs.i18n.core :refer [tru]]
+            [metabase.util
+             [i18n :refer [trs tru]]
+             [schema :as su]]
+            [schema.core :as s]
             [toucan.db :as db]))
-
-(defn ga-metric-or-segment?
-  "Is this metric or segment clause not a Metabase Metric or Segment, but rather a GA one? E.g. something like `[:metric
-  ga:users]`. We want to ignore those because they're not the same thing at all as MB Metrics/Segments and don't
-  correspond to objects in our application DB."
-  [[_ id]]
-  (boolean
-   (when ((some-fn string? keyword?) id)
-     (re-find #"^ga(id)?:" (name id)))))
-
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                    SEGMENTS                                                    |
@@ -37,15 +29,14 @@
     (db/select-id->field :definition Segment, :id [:in (set segment-ids)])))
 
 (defn- replace-segment-clauses [outer-query segment-id->definition]
-  (mbql.u/replace-clauses-in outer-query [:query] :segment
-    (fn [[_ segment-id, :as segment]]
-      (if (ga-metric-or-segment? segment)
-        segment
-        (or (:filter (segment-id->definition segment-id))
-            (throw (IllegalArgumentException. (str (tru "Segment {0} does not exist, or is invalid." segment-id)))))))))
+  (mbql.u/replace-in outer-query [:query]
+    [:segment (segment-id :guard (complement mbql.u/ga-id?))]
+    (or (:filter (segment-id->definition segment-id))
+        (throw (IllegalArgumentException. (tru "Segment {0} does not exist, or is invalid." segment-id))))))
 
-(defn- expand-segments [{inner-query :query, :as outer-query}]
-  (if-let [segments (mbql.u/clause-instances :segment inner-query)]
+(s/defn ^:private expand-segments :- mbql.s/Query
+  [{inner-query :query, :as outer-query} :- mbql.s/Query]
+  (if-let [segments (mbql.u/match inner-query :segment)]
     (replace-segment-clauses outer-query (segment-clauses->id->definition segments))
     outer-query))
 
@@ -56,38 +47,89 @@
 
 (defn- metrics
   "Return a sequence of any (non-GA) `:metric` MBQL clauses in `query`."
-  [{inner-query :query}] ; metrics won't be in a native query but they could be in source-query or aggregation clause
-  (seq (filter (complement ga-metric-or-segment?) (mbql.u/clause-instances :metric inner-query))))
+  [query]
+  ;; metrics won't be in a native query but they could be in source-query or aggregation clause
+  (mbql.u/match query [:metric (_ :guard (complement mbql.u/ga-id?))]))
 
-(defn- metric-clauses->id->definition [metric-clauses]
-  (db/select-id->field :definition Metric, :id [:in (set (map second metric-clauses))]))
+(def ^:private MetricInfo
+  {:id         su/IntGreaterThanZero
+   :name       su/NonBlankString
+   :definition {:aggregation             [(s/one mbql.s/Aggregation "aggregation clause")]
+                (s/optional-key :filter) (s/maybe mbql.s/Filter)
+                s/Keyword                s/Any}})
 
-(defn- add-metrics-filters [query metric-id->definition]
-  (let [filters (filter identity (map :filter (vals metric-id->definition)))]
+(def ^:private ^{:arglists '([metric-info])} metric-info-validation-errors (s/checker MetricInfo))
+
+(s/defn ^:private metric-clauses->id->info :- {su/IntGreaterThanZero MetricInfo}
+  [metric-clauses :- [mbql.s/metric]]
+  (when (seq metric-clauses)
+    (u/key-by :id (for [metric (db/select [Metric :id :name :definition] :id [:in (set (map second metric-clauses))])
+                        :let   [errors (u/prog1 (metric-info-validation-errors metric)
+                                         (when <>
+                                           (log/warn (trs "Invalid metric: {0} reason: {1}" metric <>))))]
+                        :when  (not errors)]
+                    metric))))
+
+(defn- add-metrics-filters [query metric-id->info]
+  (let [filters (for [{{filter-clause :filter} :definition} (vals metric-id->info)
+                      :when filter-clause]
+                  filter-clause)]
     (reduce mbql.u/add-filter-clause query filters)))
 
-(defn- replace-metrics-aggregations [query metric-id->definition]
-  (mbql.u/replace-clauses-in query [:query] :metric
-    (fn [[_ metric-id, :as metric]]
-      (if (ga-metric-or-segment? metric)
-        metric
-        (or (first (:aggregation (metric-id->definition metric-id)))
-            (throw (IllegalArgumentException.
-                    (str (tru "Metric {0} does not exist, or is invalid." metric-id)))))))))
+(s/defn ^:private metric-info->ag-clause :- mbql.s/Aggregation
+  "Return an appropriate aggregation clause from `metric-info`."
+  [{{[aggregation] :aggregation} :definition, metric-name :name} :- MetricInfo
+   {:keys [use-metric-name-as-display-name?]}                    :- {:use-metric-name-as-display-name? s/Bool}]
+  (if-not use-metric-name-as-display-name?
+    aggregation
+    ;; try to give the resulting aggregation the name of the Metric it came from, unless it already has a display
+    ;; name in which case keep that name
+    (mbql.u/match-one aggregation
+      [:aggregation-options _ (_ :guard :display-name)]
+      &match
+
+      [:aggregation-options ag options]
+      [:aggregation-options ag (assoc options :display-name metric-name)]
+
+      _
+      [:aggregation-options &match {:display-name metric-name}])))
+
+(defn- replace-metrics-aggregations [query metric-id->info]
+  (let [metric (fn [metric-id]
+                 (or (get metric-id->info metric-id)
+                     (throw (ex-info (tru "Metric {0} does not exist, or is invalid." metric-id)
+                              {:type :invalid-query, :metric metric-id}))))]
+    (mbql.u/replace-in query [:query]
+      ;; if metric is wrapped in aggregation options that give it a display name, expand the metric but do not name it
+      [:aggregation-options [:metric (metric-id :guard (complement mbql.u/ga-id?))] (options :guard :display-name)]
+      [:aggregation-options
+       (metric-info->ag-clause (metric metric-id) {:use-metric-name-as-display-name? false})
+       options]
+
+      ;; if metric is wrapped in aggregation options that *do not* give it a display name, expand the metric and then
+      ;; merge the options
+      [:aggregation-options [:metric (metric-id :guard (complement mbql.u/ga-id?))] options]
+      (let [[_ ag ag-options] (metric-info->ag-clause (metric metric-id) {:use-metric-name-as-display-name? true})]
+        [:aggregation-options ag (merge ag-options options)])
+
+      ;; otherwise for unwrapped metrics expand them in-place
+      [:metric (metric-id :guard (complement mbql.u/ga-id?))]
+      (metric-info->ag-clause (metric metric-id) {:use-metric-name-as-display-name? true}))))
 
 (defn- add-metrics-clauses
   "Add appropriate `filter` and `aggregation` clauses for a sequence of Metrics.
 
     (add-metrics-clauses {:query {}} [[:metric 10]])
     ;; -> {:query {:aggregation [[:count]], :filter [:= [:field-id 10] 20]}}"
-  [query metric-id->definition]
+  [query metric-id->info]
   (-> query
-      (add-metrics-filters metric-id->definition)
-      (replace-metrics-aggregations metric-id->definition)))
+      (add-metrics-filters metric-id->info)
+      (replace-metrics-aggregations metric-id->info)))
 
-(defn- expand-metrics [query]
+(s/defn ^:private expand-metrics :- mbql.s/Query
+  [query :- mbql.s/Query]
   (if-let [metrics (metrics query)]
-    (add-metrics-clauses query (metric-clauses->id->definition metrics))
+    (add-metrics-clauses query (metric-clauses->id->info metrics))
     query))
 
 
@@ -95,24 +137,22 @@
 ;;; |                                                   MIDDLEWARE                                                   |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn- expand-metrics-and-segments
+(s/defn ^:private expand-metrics-and-segments  :- mbql.s/Query
   "Expand the macros (`segment`, `metric`) in a `query`."
-  [query]
+  [query  :- mbql.s/Query]
   (-> query
       expand-metrics
       expand-segments))
 
-
-(defn- expand-macros* [query]
-  (if-not (qputil/mbql-query? query)
+(defn- expand-macros*
+  [{query-type :type, :as query}]
+  (if-not (= query-type :query)
     query
-    (u/prog1 (expand-metrics-and-segments query)
-      (when (and (not i/*disable-qp-logging*)
-                 (not= <> query))
-        (log/debug (u/format-color 'cyan "\n\nMACRO/SUBSTITUTED: %s\n%s" (u/emoji "😻") (u/pprint-to-str <>)))))))
+    (expand-metrics-and-segments query)))
 
 (defn expand-macros
   "Middleware that looks for `:metric` and `:segment` macros in an unexpanded MBQL query and substitute the macros for
   their contents."
   [qp]
-  (comp qp expand-macros*))
+  (fn [query rff context]
+    (qp (expand-macros* query) rff context)))

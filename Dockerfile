@@ -2,7 +2,8 @@
 # STAGE 1: builder
 ###################
 
-FROM openjdk:8-jdk-alpine as builder
+# Build currently doesn't work on > Java 11 (i18n utils are busted) so build on 8 until we fix this
+FROM adoptopenjdk/openjdk8:alpine as builder
 
 WORKDIR /app/source
 
@@ -12,13 +13,11 @@ ENV LC_CTYPE en_US.UTF-8
 # bash:    various shell scripts
 # wget:    installing lein
 # git:     ./bin/version
-# nodejs:  frontend building
+# yarn:  frontend building
 # make:    backend building
 # gettext: translations
-RUN apk add --update bash nodejs nodejs-npm git wget make gettext
 
-# yarn:    frontend dependencies
-RUN npm install -g yarn
+RUN apk add --update coreutils bash yarn git wget make gettext
 
 # lein:    backend dependencies and building
 ADD https://raw.github.com/technomancy/leiningen/stable/bin/lein /usr/local/bin/lein
@@ -32,7 +31,7 @@ ADD project.clj .
 RUN lein deps
 
 # frontend dependencies
-ADD yarn.lock package.json ./
+ADD yarn.lock package.json .yarnrc ./
 RUN yarn
 
 # add the rest of the source
@@ -55,7 +54,7 @@ RUN keytool -noprompt -import -trustcacerts -alias aws-rds \
 # # STAGE 2: runner
 # ###################
 
-FROM java:openjdk-8-jre-alpine as runner
+FROM adoptopenjdk/openjdk11:alpine-jre as runner
 
 WORKDIR /app
 
@@ -66,12 +65,16 @@ ENV LC_CTYPE en_US.UTF-8
 RUN apk add --update bash ttf-dejavu fontconfig
 
 # add fixed cacerts
-COPY --from=builder /etc/ssl/certs/java/cacerts /usr/lib/jvm/default-jvm/jre/lib/security/cacerts
+COPY --from=builder /etc/ssl/certs/java/cacerts /opt/java/openjdk/lib/security/cacerts
 
 # add Metabase script and uberjar
 RUN mkdir -p bin target/uberjar
 COPY --from=builder /app/source/target/uberjar/metabase.jar /app/target/uberjar/
 COPY --from=builder /app/source/bin/start /app/bin/
+
+# create the plugins directory, with writable permissions
+RUN mkdir -p /plugins
+RUN chmod a+rwx /plugins
 
 # expose our default runtime port
 EXPOSE 3000

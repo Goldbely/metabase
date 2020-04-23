@@ -1,6 +1,9 @@
 /* @flow */
 
-import { mbqlEq, noNullValues, add, update, remove, clear } from "./util";
+import { noNullValues, add, update, remove, clear } from "./util";
+import { isValidField } from "./field_ref";
+import { STANDARD_AGGREGATIONS } from "metabase/lib/expressions";
+
 import _ from "underscore";
 
 import type { AggregationClause, Aggregation } from "metabase/meta/types/Query";
@@ -18,7 +21,7 @@ export function getAggregations(
   } else {
     aggregations = [];
   }
-  return aggregations.filter(agg => agg && agg[0] && !mbqlEq(agg[0], "rows"));
+  return aggregations.filter(agg => agg && agg[0] && agg[0] !== "rows");
 }
 
 // turns a list of Aggregations into the canonical AggregationClause
@@ -70,4 +73,22 @@ export function hasEmptyAggregation(ac: ?AggregationClause): boolean {
 
 export function hasValidAggregation(ac: ?AggregationClause): boolean {
   return _.all(getAggregations(ac), aggregation => noNullValues(aggregation));
+}
+
+// AGGREGATION TYPES
+
+export function isStandard(aggregation: AggregationClause): boolean {
+  return (
+    Array.isArray(aggregation) &&
+    STANDARD_AGGREGATIONS.has(aggregation[0]) &&
+    (aggregation[1] === undefined || isValidField(aggregation[1]))
+  );
+}
+
+export function isMetric(aggregation: AggregationClause): boolean {
+  return Array.isArray(aggregation) && aggregation[0] === "metric";
+}
+
+export function isCustom(aggregation: AggregationClause): boolean {
+  return !isStandard(aggregation) && !isMetric(aggregation);
 }

@@ -6,8 +6,10 @@
             [metabase
              [public-settings :as public-settings]
              [util :as u]]
-            [metabase.api.common :as api :refer [*current-user-id* *current-user-permissions-set*]]
-            [metabase.mbql.util :as mbql.u]
+            [metabase.api.common :as api :refer [*current-user-id*]]
+            [metabase.mbql
+             [normalize :as normalize]
+             [util :as mbql.u]]
             [metabase.models
              [dependency :as dependency]
              [field-values :as field-values]
@@ -21,8 +23,7 @@
             [metabase.util.i18n :as ui18n :refer [tru]]
             [toucan
              [db :as db]
-             [models :as models]]
-            [metabase.mbql.normalize :as normalize]))
+             [models :as models]]))
 
 (models/defmodel Card :report_card)
 
@@ -41,8 +42,10 @@
 (defn- extract-ids
   "Get all the Segment or Metric IDs referenced by a query."
   [segment-or-metric query]
-  (set (for [[_ id] (mbql.u/clause-instances segment-or-metric query)]
-         id)))
+  (set
+   (case segment-or-metric
+     :segment (mbql.u/match query [:segment id] id)
+     :metric  (mbql.u/match query [:metric  id] id))))
 
 (defn card-dependencies
   "Calculate any dependent objects for a given `card`."
@@ -54,17 +57,17 @@
       :Segment (extract-ids :segment inner-query)})))
 
 
-;;; -------------------------------------------------- Revisions --------------------------------------------------
+;;; --------------------------------------------------- Revisions ----------------------------------------------------
 
 (defn serialize-instance
   "Serialize a `Card` for use in a `Revision`."
   ([instance]
    (serialize-instance nil nil instance))
   ([_ _ instance]
-   (dissoc instance :created_at :updated_at)))
+   (dissoc instance :created_at :updated_at :result_metadata)))
 
 
-;;; -------------------------------------------------- Lifecycle --------------------------------------------------
+;;; --------------------------------------------------- Lifecycle ----------------------------------------------------
 
 (defn populate-query-fields
   "Lift `database_id`, `table_id`, and `query_type` from query definition."
@@ -89,18 +92,18 @@
 
         (ids-already-seen source-card-id)
         (throw
-         (ui18n/ex-info (tru "Cannot save Question: source query has circular references.")
+         (ex-info (tru "Cannot save Question: source query has circular references.")
            {:status-code 400}))
 
         :else
         (recur (or (db/select-one-field :dataset_query Card :id source-card-id)
-                   (throw (ui18n/ex-info (tru "Card {0} does not exist." source-card-id)
+                   (throw (ex-info (tru "Card {0} does not exist." source-card-id)
                             {:status-code 404})))
                (conj ids-already-seen source-card-id))))))
 
 (defn- maybe-normalize-query [card]
   (cond-> card
-    (:dataset_query card) (update :dataset_query normalize/normalize)))
+    (seq (:dataset_query card)) (update :dataset_query normalize/normalize)))
 
 (defn- pre-insert [{query :dataset_query, :as card}]
   ;; TODO - we usually check permissions to save/update stuff in the API layer rather than here in the Toucan
@@ -110,10 +113,9 @@
     ;; Make sure the User saving the Card has the appropriate permissions to run its query. We don't want Users saving
     ;; Cards with queries they wouldn't be allowed to run!
     (when *current-user-id*
-      (when-not (perms/set-has-full-permissions-for-set? @*current-user-permissions-set*
-                  (query-perms/perms-set query :throw-exceptions))
-        (throw (Exception. (str (tru "You do not have permissions to run ad-hoc native queries against Database {0}."
-                                     (:database query)))))))
+      (when-not (query-perms/can-run-query? query)
+        (throw (Exception. (tru "You do not have permissions to run ad-hoc native queries against Database {0}."
+                                (:database query))))))
     ;; make sure this Card doesn't have circular source query references
     (check-for-circular-source-query-references card)))
 
@@ -151,6 +153,7 @@
     (when (:dataset_query card)
       (check-for-circular-source-query-references card))))
 
+;; Cards don't normally get deleted (they get archived instead) so this mostly affects tests
 (defn- pre-delete [{:keys [id]}]
   (db/delete! 'PulseCard :card_id id)
   (db/delete! 'Revision :model "Card", :model_id id)
@@ -164,7 +167,6 @@
   (merge models/IModelDefaults
          {:hydration-keys (constantly [:card])
           :types          (constantly {:dataset_query          :metabase-query
-                                       :description            :clob
                                        :display                :keyword
                                        :embedding_params       :json
                                        :query_type             :keyword

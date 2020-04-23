@@ -1,55 +1,61 @@
 (ns metabase.test.data.mysql
   "Code for creating / destroying a MySQL database from a `DatabaseDefinition`."
-  (:require [clojure.java.jdbc :as jdbc]
-            [metabase.driver.generic-sql :as gsql]
-            [metabase.driver.mysql :as mysql]
-            [metabase.test.data
-             [generic-sql :as generic]
-             [interface :as i]]
-            [metabase.util :as u]))
+  (:require [metabase.test.data
+             [interface :as tx]
+             [sql :as sql.tx]
+             [sql-jdbc :as sql-jdbc.tx]]
+            [metabase.test.data.sql-jdbc
+             [execute :as execute]
+             [load-data :as load-data]]))
 
-(def ^:private ^:const field-base-type->sql-type
-  {:type/BigInteger     "BIGINT"
-   :type/Boolean        "BOOLEAN" ; Synonym of TINYINT(1)
-   :type/Date           "DATE"
-   :type/DateTime       "TIMESTAMP"
-   :type/DateTimeWithTZ "TIMESTAMP"
-   :type/Decimal        "DECIMAL"
-   :type/Float          "DOUBLE"
-   :type/Integer        "INTEGER"
-   :type/Text           "TEXT"
-   :type/Time           "TIME"})
+(sql-jdbc.tx/add-test-extensions! :mysql)
 
-(defn- database->connection-details [context {:keys [database-name]}]
-  (merge {:host         (i/db-test-env-var-or-throw :mysql :host "localhost")
-          :port         (i/db-test-env-var-or-throw :mysql :port 3306)
-          :user         (i/db-test-env-var :mysql :user "root")
-          :timezone     :America/Los_Angeles
-;;          :serverTimezone "UTC"
-          }
-         (when-let [password (i/db-test-env-var :mysql :password)]
-           {:password password})
-         (when (= context :db)
-           {:db database-name})))
+(doseq [[base-type database-type] {:type/BigInteger     "BIGINT"
+                                   :type/Boolean        "BOOLEAN"
+                                   :type/Date           "DATE"
+                                   ;; (3) is fractional seconds precision, i.e. millisecond precision
+                                   :type/DateTime       "DATETIME(3)"
+                                   ;; MySQL is extra dumb and can't have two `TIMESTAMP` columns without default
+                                   ;; values — see
+                                   ;; https://stackoverflow.com/questions/11601034/unable-to-create-2-timestamp-columns-in-1-mysql-table.
+                                   ;; They also have to have non-zero values. See also
+                                   ;; https://dba.stackexchange.com/questions/6171/invalid-default-value-for-datetime-when-changing-to-utf8-general-ci
+                                   :type/DateTimeWithTZ "TIMESTAMP(3) DEFAULT '1970-01-01 00:00:01'"
+                                   :type/Decimal        "DECIMAL"
+                                   :type/Float          "DOUBLE"
+                                   :type/Integer        "INTEGER"
+                                   :type/Text           "TEXT"
+                                   :type/Time           "TIME(3)"}]
+  (defmethod sql.tx/field-base-type->sql-type [:mysql base-type] [_ _] database-type))
 
-(defn- add-connection-params [spec]
-  ;; allow inserting dates where value is '0000-00-00' -- this is disallowed by default on newer versions of MySQL, but we still want to test that we can handle it correctly for older ones
-  (update spec :subname (u/rpartial str "&sessionVariables=sql_mode='ALLOW_INVALID_DATES'")))
+(defmethod tx/dbdef->connection-details :mysql
+  [_ context {:keys [database-name]}]
+  (merge
+   {:host (tx/db-test-env-var-or-throw :mysql :host "localhost")
+    :port (tx/db-test-env-var-or-throw :mysql :port 3306)
+    :user (tx/db-test-env-var :mysql :user "root")}
+   (when-let [password (tx/db-test-env-var :mysql :password)]
+     {:password password})
+   (when (= context :db)
+     {:db database-name})))
 
-(defn- quote-name [nm]
-  (str \` nm \`))
+(defmethod tx/aggregate-column-info :mysql
+  ([driver ag-type]
+   ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type))
 
+  ([driver ag-type field]
+   (merge
+    ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type field)
+    (when (= ag-type :sum)
+      {:base_type :type/Decimal}))))
 
-(u/strict-extend (class (mysql/->MySQLDriver))
-  generic/IGenericSQLTestExtensions
-  (merge generic/DefaultsMixin
-         {:database->spec            (comp add-connection-params (:database->spec generic/DefaultsMixin))
-          :execute-sql!              generic/sequentially-execute-sql! ; TODO - we might be able to do SQL all at once by setting `allowMultiQueries=true` on the connection string
-          :field-base-type->sql-type (u/drop-first-arg field-base-type->sql-type)
-          :load-data!                generic/load-data-all-at-once!
-          :pk-sql-type               (constantly "INTEGER NOT NULL AUTO_INCREMENT")
-          :quote-name                (u/drop-first-arg quote-name)})
-  i/IDriverTestExtensions
-  (merge generic/IDriverTestExtensionsMixin
-         {:database->connection-details (u/drop-first-arg database->connection-details)
-          :engine                       (constantly :mysql)}))
+;; TODO - we might be able to do SQL all at once by setting `allowMultiQueries=true` on the connection string
+(defmethod execute/execute-sql! :mysql
+  [& args]
+  (apply execute/sequentially-execute-sql! args))
+
+(defmethod load-data/load-data! :mysql
+  [& args]
+  (apply load-data/load-data-all-at-once! args))
+
+(defmethod sql.tx/pk-sql-type :mysql [_] "INTEGER NOT NULL AUTO_INCREMENT")

@@ -1,15 +1,8 @@
 /* @flow */
 
-import {
-  mbqlEq,
-  op,
-  args,
-  noNullValues,
-  add,
-  update,
-  remove,
-  clear,
-} from "./util";
+import { op, args, noNullValues, add, update, remove, clear } from "./util";
+import { isValidField } from "./field_ref";
+import { STANDARD_FILTERS } from "metabase/lib/expressions";
 
 import type {
   FilterClause,
@@ -21,7 +14,7 @@ import type {
 export function getFilters(filter: ?FilterClause): Filter[] {
   if (!filter || (Array.isArray(filter) && filter.length === 0)) {
     return [];
-  } else if (mbqlEq(op(filter), "and")) {
+  } else if (op(filter) === "and") {
     return args(filter);
   } else {
     return [filter];
@@ -72,30 +65,39 @@ export function canAddFilter(filter: ?FilterClause): boolean {
   return true;
 }
 
-export function isSegmentFilter(filter: FilterClause): boolean {
-  return Array.isArray(filter) && mbqlEq(filter[0], "segment");
-}
+// FILTER TYPES
 
-export function isCompoundFilter(filter: FilterClause): boolean {
+export function isStandard(filter: FilterClause): boolean {
   return (
     Array.isArray(filter) &&
-    (mbqlEq(filter[0], "and") || mbqlEq(filter[0], "or"))
+    (STANDARD_FILTERS.has(filter[0]) || filter[0] === null) &&
+    (filter[1] === undefined || isValidField(filter[1]))
   );
 }
 
-export function isFieldFilter(filter: FilterClause): boolean {
-  return !isSegmentFilter(filter) && !isCompoundFilter(filter);
+export function isSegment(filter: FilterClause): boolean {
+  return Array.isArray(filter) && filter[0] === "segment";
 }
+
+export function isCustom(filter: FilterClause): boolean {
+  return !isStandard(filter) && !isSegment(filter);
+}
+
+export function isFieldFilter(filter: FilterClause): boolean {
+  return !isSegment(filter) && isValidField(filter[1]);
+}
+
+// FILTER OPTIONS
 
 // TODO: is it safe to assume if the last item is an object then it's options?
 export function hasFilterOptions(filter: Filter): boolean {
   const o = filter[filter.length - 1];
-  return !!o && typeof o == "object" && o.constructor == Object;
+  return !!o && typeof o == "object" && o.constructor === Object;
 }
 
 export function getFilterOptions(filter: Filter): FilterOptions {
   // NOTE: just make a new "any" variable since getting flow to type checking this is a nightmare
-  let _filter: any = filter;
+  const _filter: any = filter;
   if (hasFilterOptions(filter)) {
     return _filter[_filter.length - 1];
   } else {

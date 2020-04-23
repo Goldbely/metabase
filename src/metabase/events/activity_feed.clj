@@ -11,10 +11,11 @@
              [card :refer [Card]]
              [dashboard :refer [Dashboard]]
              [table :as table]]
+            [metabase.util.i18n :refer [tru]]
             [toucan.db :as db]))
 
-(def activity-feed-topics
-  "The `Set` of event topics which are subscribed to for use in the Metabase activity feed."
+(def ^:private activity-feed-topics
+  "The set of event topics which are subscribed to for use in the Metabase activity feed."
   #{:alert-create
     :alert-delete
     :card-create
@@ -33,7 +34,7 @@
     :segment-create
     :segment-update
     :segment-delete
-    :user-login})
+    :user-login}) ; this is only used these days the first time someone logs in to record 'user-joined' events
 
 (def ^:private activity-feed-channel
   "Channel for receiving event notifications we want to subscribe to for the activity feed."
@@ -42,11 +43,13 @@
 
 ;;; ------------------------------------------------ EVENT PROCESSING ------------------------------------------------
 
-(defn- process-card-activity! [topic object]
+(defn- process-card-activity! [topic {query :dataset_query, :as object}]
   (let [details-fn  #(select-keys % [:name :description])
-        query       (u/ignore-exceptions (qp/expand (:dataset_query object)))
-        database-id (when-let [database (:database query)]
-                      (u/get-id database))
+        query       (when (seq query)
+                      (try (qp/query->preprocessed query)
+                           (catch Throwable e
+                             (log/error e (tru "Error preprocessing query:")))))
+        database-id (some-> query :database u/get-id)
         table-id    (mbql.u/query->source-table-id query)]
     (activity/record-activity!
       :topic       topic

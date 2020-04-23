@@ -1,39 +1,234 @@
 (ns metabase.driver.mysql
-  "MySQL driver. Builds off of the Generic SQL driver."
-  (:require [clj-time
-             [coerce :as tcoerce]
-             [core :as t]
-             [format :as time]]
-            [clojure
+  "MySQL driver. Builds off of the SQL-JDBC driver."
+  (:require [clojure
              [set :as set]
              [string :as str]]
+            [clojure.java.jdbc :as jdbc]
+            [clojure.tools.logging :as log]
             [honeysql.core :as hsql]
+            [java-time :as t]
             [metabase
              [driver :as driver]
              [util :as u]]
             [metabase.db.spec :as dbspec]
-            [metabase.driver.generic-sql :as sql]
-            [metabase.driver.generic-sql.query-processor :as sqlqp]
+            [metabase.driver.common :as driver.common]
+            [metabase.driver.sql-jdbc
+             [common :as sql-jdbc.common]
+             [connection :as sql-jdbc.conn]
+             [execute :as sql-jdbc.execute]
+             [sync :as sql-jdbc.sync]]
+            [metabase.driver.sql.query-processor :as sql.qp]
+            [metabase.driver.sql.util.unprepare :as unprepare]
+            [metabase.query-processor.timezone :as qp.timezone]
             [metabase.util
-             [date :as du]
              [honeysql-extensions :as hx]
-             [ssh :as ssh]]
-            [schema.core :as s])
-  (:import java.sql.Time
-           [java.util Date TimeZone]
-           metabase.util.honeysql_extensions.Literal
-           org.joda.time.format.DateTimeFormatter))
+             [i18n :refer [trs]]
+             [ssh :as ssh]])
+  (:import [java.sql DatabaseMetaData ResultSet ResultSetMetaData Types]
+           [java.time LocalDateTime OffsetDateTime OffsetTime ZonedDateTime]))
 
-(defrecord MySQLDriver []
-  :load-ns true
-  clojure.lang.Named
-  (getName [_] "MySQL"))
+(driver/register! :mysql, :parent :sql-jdbc)
+
+(def ^:private ^:const min-supported-mysql-version 5.7)
+(def ^:private ^:const min-supported-mariadb-version 10.2)
+
+(defmethod driver/display-name :mysql [_] "MySQL")
+
+(defmethod driver/supports? [:mysql :regex] [_ _] false)
+(defmethod driver/supports? [:mysql :percentile-aggregations] [_ _] false)
+
+
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                  METHOD IMPLS                                                  |
+;;; |                                             metabase.driver impls                                              |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn- column->base-type [column-type]
+(defn- mariadb? [^DatabaseMetaData metadata]
+  (= (.getDatabaseProductName metadata) "MariaDB"))
+
+(defn- db-version [^DatabaseMetaData metadata]
+  (Double/parseDouble
+   (format "%d.%d" (.getDatabaseMajorVersion metadata) (.getDatabaseMinorVersion metadata))))
+
+(defn- unsupported-version? [^DatabaseMetaData metadata]
+  (< (db-version metadata)
+     (if (mariadb? metadata) min-supported-mariadb-version min-supported-mysql-version)))
+
+(defn- warn-on-unsupported-versions [driver details]
+  (let [jdbc-spec (sql-jdbc.conn/details->connection-spec-for-testing-connection driver details)]
+    (jdbc/with-db-metadata [metadata jdbc-spec]
+      (when (unsupported-version? metadata)
+        (log/warn
+         (u/format-color 'red
+             (str
+              "\n\n********************************************************************************\n"
+              (trs "WARNING: Metabase only officially supports MySQL {0}/MariaDB {1} and above."
+                   min-supported-mysql-version
+                   min-supported-mariadb-version)
+              "\n"
+              (trs "All Metabase features may not work properly when using an unsupported version.")
+              "\n********************************************************************************\n")))))))
+
+(defmethod driver/can-connect? :mysql
+  [driver details]
+  ;; delegate to parent method to check whether we can connect; if so, check if it's an unsupported version and issue
+  ;; a warning if it is
+  (when ((get-method driver/can-connect? :sql-jdbc) driver details)
+    (warn-on-unsupported-versions driver details)
+    true))
+
+(defmethod driver/supports? [:mysql :full-join] [_ _] false)
+
+(defmethod driver/connection-properties :mysql
+  [_]
+  (ssh/with-tunnel-config
+    [driver.common/default-host-details
+     (assoc driver.common/default-port-details :default 3306)
+     driver.common/default-dbname-details
+     driver.common/default-user-details
+     driver.common/default-password-details
+     driver.common/default-ssl-details
+     (assoc driver.common/default-additional-options-details
+       :placeholder  "tinyInt1isBit=false")]))
+
+(defmethod sql.qp/add-interval-honeysql-form :mysql
+  [driver hsql-form amount unit]
+  ;; MySQL doesn't support `:millisecond` as an option, but does support fractional seconds
+  (if (= unit :millisecond)
+    (recur driver hsql-form (/ amount 1000.0) :second)
+    (hsql/call :date_add hsql-form (hsql/raw (format "INTERVAL %s %s" amount (name unit))))))
+
+(defmethod driver/humanize-connection-error-message :mysql
+  [_ message]
+  (condp re-matches message
+    #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$"
+    (driver.common/connection-error-messages :cannot-connect-check-host-and-port)
+
+    #"^Unknown database .*$"
+    (driver.common/connection-error-messages :database-name-incorrect)
+
+    #"Access denied for user.*$"
+    (driver.common/connection-error-messages :username-or-password-incorrect)
+
+    #"Must specify port after ':' in connection string"
+    (driver.common/connection-error-messages :invalid-hostname)
+
+    #".*"                               ; default
+    message))
+
+(defmethod driver/db-default-timezone :mysql
+  [_ db]
+  (let [spec                                   (sql-jdbc.conn/db->pooled-connection-spec db)
+        sql                                    (str "SELECT @@GLOBAL.time_zone AS global_tz,"
+                                                    " @@system_time_zone AS system_tz,"
+                                                    " time_format("
+                                                    "   timediff("
+                                                    "      now(), convert_tz(now(), @@GLOBAL.time_zone, '+00:00')"
+                                                    "   ),"
+                                                    "   '%H:%i'"
+                                                    " ) AS offset;")
+        [{:keys [global_tz system_tz offset]}] (jdbc/query spec sql)
+        the-valid-id                           (fn [zone-id]
+                                                 (when zone-id
+                                                   (try
+                                                     (.getId (t/zone-id zone-id))
+                                                     (catch Throwable _))))]
+    (or
+     ;; if global timezone ID is 'SYSTEM', then try to use the system timezone ID
+     (when (= global_tz "SYSTEM")
+       (the-valid-id system_tz))
+     ;; otherwise try to use the global ID
+     (the-valid-id global_tz)
+     ;; failing that, calculate the offset between now in the global timezone and now in UTC. Non-negative offsets
+     ;; don't come back with `+` so add that if needed
+     (if (str/starts-with? offset "-")
+       offset
+       (str \+ offset)))))
+
+;; MySQL LIKE clauses are case-sensitive or not based on whether the collation of the server and the columns
+;; themselves. Since this isn't something we can really change in the query itself don't present the option to the
+;; users in the UI
+(defmethod driver/supports? [:mysql :case-sensitivity-string-filter-options] [_ _] false)
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                           metabase.driver.sql impls                                            |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defmethod sql.qp/unix-timestamp->honeysql [:mysql :seconds] [_ _ expr]
+  (hsql/call :from_unixtime expr))
+
+(defn- date-format [format-str expr] (hsql/call :date_format expr (hx/literal format-str)))
+(defn- str-to-date [format-str expr] (hsql/call :str_to_date expr (hx/literal format-str)))
+
+
+(defmethod sql.qp/->float :mysql
+  [_ value]
+  ;; no-op as MySQL doesn't support cast to float
+  value)
+
+(defmethod sql.qp/->honeysql [:mysql :regex-match-first]
+  [driver [_ arg pattern]]
+  (hsql/call :regexp_substr (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)))
+
+(defmethod sql.qp/->honeysql [:mysql :length]
+  [driver [_ arg]]
+  (hsql/call :char_length (sql.qp/->honeysql driver arg)))
+
+
+;; Since MySQL doesn't have date_trunc() we fake it by formatting a date to an appropriate string and then converting
+;; back to a date. See http://dev.mysql.com/doc/refman/5.6/en/date-and-time-functions.html#function_date-format for an
+;; explanation of format specifiers
+(defn- trunc-with-format [format-str expr]
+  (str-to-date format-str (date-format format-str expr)))
+
+(defmethod sql.qp/date [:mysql :default]         [_ _ expr] expr)
+(defmethod sql.qp/date [:mysql :minute]          [_ _ expr] (trunc-with-format "%Y-%m-%d %H:%i" expr))
+(defmethod sql.qp/date [:mysql :minute-of-hour]  [_ _ expr] (hx/minute expr))
+(defmethod sql.qp/date [:mysql :hour]            [_ _ expr] (trunc-with-format "%Y-%m-%d %H" expr))
+(defmethod sql.qp/date [:mysql :hour-of-day]     [_ _ expr] (hx/hour expr))
+(defmethod sql.qp/date [:mysql :day]             [_ _ expr] (hsql/call :date expr))
+(defmethod sql.qp/date [:mysql :day-of-week]     [_ _ expr] (hsql/call :dayofweek expr))
+(defmethod sql.qp/date [:mysql :day-of-month]    [_ _ expr] (hsql/call :dayofmonth expr))
+(defmethod sql.qp/date [:mysql :day-of-year]     [_ _ expr] (hsql/call :dayofyear expr))
+(defmethod sql.qp/date [:mysql :month-of-year]   [_ _ expr] (hx/month expr))
+(defmethod sql.qp/date [:mysql :quarter-of-year] [_ _ expr] (hx/quarter expr))
+(defmethod sql.qp/date [:mysql :year]            [_ _ expr] (hsql/call :makedate (hx/year expr) 1))
+
+;; To convert a YEARWEEK (e.g. 201530) back to a date you need tell MySQL which day of the week to use,
+;; because otherwise as far as MySQL is concerned you could be talking about any of the days in that week
+(defmethod sql.qp/date [:mysql :week] [_ _ expr]
+  (str-to-date "%X%V %W"
+               (hx/concat (hsql/call :yearweek expr)
+                          (hx/literal " Sunday"))))
+
+;; mode 6: Sunday is first day of week, first week of year is the first one with 4+ days
+(defmethod sql.qp/date [:mysql :week-of-year] [_ _ expr]
+  (hx/inc (hx/week expr 6)))
+
+(defmethod sql.qp/date [:mysql :month] [_ _ expr]
+  (str-to-date "%Y-%m-%d"
+               (hx/concat (date-format "%Y-%m" expr)
+                          (hx/literal "-01"))))
+
+;; Truncating to a quarter is trickier since there aren't any format strings.
+;; See the explanation in the H2 driver, which does the same thing but with slightly different syntax.
+(defmethod sql.qp/date [:mysql :quarter] [_ _ expr]
+  (str-to-date "%Y-%m-%d"
+               (hx/concat (hx/year expr)
+                          (hx/literal "-")
+                          (hx/- (hx/* (hx/quarter expr)
+                                      3)
+                                2)
+                          (hx/literal "-01"))))
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                         metabase.driver.sql-jdbc impls                                         |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defmethod sql-jdbc.sync/database-type->base-type :mysql
+  [_ database-type]
   ({:BIGINT     :type/BigInteger
     :BINARY     :type/*
     :BIT        :type/Boolean
@@ -58,248 +253,123 @@
     :SMALLINT   :type/Integer
     :TEXT       :type/Text
     :TIME       :type/Time
-    :TIMESTAMP  :type/DateTime
+    :TIMESTAMP  :type/DateTimeWithLocalTZ ; stored as UTC in the database
     :TINYBLOB   :type/*
     :TINYINT    :type/Integer
     :TINYTEXT   :type/Text
     :VARBINARY  :type/*
     :VARCHAR    :type/Text
-    :YEAR       :type/Integer} (keyword (str/replace (name column-type) #"\sUNSIGNED$" "")))) ; strip off " UNSIGNED" from end if present
+    :YEAR       :type/Integer}
+   ;; strip off " UNSIGNED" from end if present
+   (keyword (str/replace (name database-type) #"\sUNSIGNED$" ""))))
 
-(def ^:private ^:const default-connection-args
-  "Map of args for the MySQL JDBC connection string.
-   Full list of is options is available here: http://dev.mysql.com/doc/connector-j/6.0/en/connector-j-reference-configuration-properties.html"
-  {;; 0000-00-00 dates are valid in MySQL; convert these to `null` when they come back because they're illegal in Java
-   :zeroDateTimeBehavior          :convertToNull
+(def ^:private default-connection-args
+  "Map of args for the MySQL/MariaDB JDBC connection string."
+  { ;; 0000-00-00 dates are valid in MySQL; convert these to `null` when they come back because they're illegal in Java
+   :zeroDateTimeBehavior "convertToNull"
    ;; Force UTF-8 encoding of results
-   :useUnicode                    :true
-   :characterEncoding             :UTF8
-   :characterSetResults           :UTF8
-   ;; Needs to be true to set useJDBCCompliantTimezoneShift to true
-   :useLegacyDatetimeCode         :true
-   ;; This allows us to adjust the timezone of timestamps as we pull them from the resultset
-   :useJDBCCompliantTimezoneShift :true})
+   :useUnicode           true
+   :characterEncoding    "UTF8"
+   :characterSetResults  "UTF8"
+   ;; GZIP compress packets sent between Metabase server and MySQL/MariaDB database
+   :useCompression       true})
 
-(def ^:private ^:const ^String default-connection-args-string
-  (str/join \& (for [[k v] default-connection-args]
-                 (str (name k) \= (name v)))))
+(defmethod sql-jdbc.conn/connection-details->spec :mysql
+  [_ {ssl? :ssl, :keys [additional-options], :as details}]
+  ;; In versions older than 0.32.0 the MySQL driver did not correctly save `ssl?` connection status. Users worked
+  ;; around this by including `useSSL=true`. Check if that's there, and if it is, assume SSL status. See #9629
+  ;;
+  ;; TODO - should this be fixed by a data migration instead?
+  (let [ssl? (or ssl? (some-> additional-options (str/includes? "useSSL=true")))]
+    (when (and ssl?
+               (not (some->  additional-options (str/includes? "trustServerCertificate"))))
+      (log/info (trs "You may need to add 'trustServerCertificate=true' to the additional connection options to connect with SSL.")))
+    (merge
+     default-connection-args
+     ;; newer versions of MySQL will complain if you don't specify this when not using SSL
+     {:useSSL (boolean ssl?)}
+     (let [details (-> details
+                       (set/rename-keys {:dbname :db})
+                       (dissoc :ssl))]
+       (-> (dbspec/mysql details)
+           (sql-jdbc.common/handle-additional-options details))))))
 
-(defn- append-connection-args
-  "Append `default-connection-args-string` to the connection string in CONNECTION-DETAILS, and an additional option to
-  explicitly disable SSL if appropriate. (Newer versions of MySQL will complain if you don't explicitly disable SSL.)"
-  {:argslist '([connection-spec details])}
-  [{connection-string :subname, :as connection-spec} {ssl? :ssl}]
-  (assoc connection-spec
-    :subname (str connection-string "?" default-connection-args-string (when-not ssl?
-                                                                         "&useSSL=false"))))
+(defmethod sql-jdbc.sync/active-tables :mysql
+  [& args]
+  (apply sql-jdbc.sync/post-filtered-active-tables args))
 
-(defn- connection-details->spec [details]
-  (-> details
-      (set/rename-keys {:dbname :db})
-      dbspec/mysql
-      (append-connection-args details)
-      (sql/handle-additional-options details)))
+(defmethod sql-jdbc.sync/excluded-schemas :mysql
+  [_]
+  #{"INFORMATION_SCHEMA"})
 
-(defn- unix-timestamp->timestamp [expr seconds-or-milliseconds]
-  (hsql/call :from_unixtime (case seconds-or-milliseconds
-                              :seconds      expr
-                              :milliseconds (hx// expr 1000))))
+(defmethod sql.qp/quote-style :mysql [_] :mysql)
 
-(defn- date-format [format-str expr] (hsql/call :date_format expr (hx/literal format-str)))
-(defn- str-to-date [format-str expr] (hsql/call :str_to_date expr (hx/literal format-str)))
+;; If this fails you need to load the timezone definitions from your system into MySQL; run the command
+;;
+;;    `mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql`
+;;
+;; See https://dev.mysql.com/doc/refman/5.7/en/time-zone-support.html for details
+;;
+(defmethod sql-jdbc.execute/set-timezone-sql :mysql
+  [_]
+  "SET @@session.time_zone = %s;")
 
-(def ^:private ^DateTimeFormatter timezone-offset-formatter
-  "JodaTime formatter that returns just the raw timezone offset, e.g. `-08:00` or `+00:00`."
-  (time/formatter "ZZ"))
+(defmethod sql-jdbc.execute/set-parameter [:mysql OffsetTime]
+  [driver ps i t]
+  ;; convert to a LocalTime so MySQL doesn't get F U S S Y
+  (sql-jdbc.execute/set-parameter driver ps i (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))))
 
-(defn- timezone-id->offset-str
-  "Get an appropriate timezone offset string for a timezone with `timezone-id` and `date-time`. MySQL only accepts
-  these offsets as strings like `-8:00`.
+;; Regardless of session timezone it seems to be the case that OffsetDateTimes get normalized to UTC inside MySQL
+;;
+;; Since MySQL TIMESTAMPs aren't timezone-aware this means comparisons are done between timestamps in the report
+;; timezone and the local datetime portion of the parameter, in UTC. Bad!
+;;
+;; Convert it to a LocalDateTime, in the report timezone, so comparisions will work correctly.
+;;
+;; See also — https://dev.mysql.com/doc/refman/5.5/en/datetime.html
+;;
+;; TIMEZONE FIXME — not 100% sure this behavior makes sense
+(defmethod sql-jdbc.execute/set-parameter [:mysql OffsetDateTime]
+  [driver ^java.sql.PreparedStatement ps ^Integer i t]
+  (let [zone   (t/zone-id (qp.timezone/results-timezone-id))
+        offset (.. zone getRules (getOffset (t/instant t)))
+        t      (t/local-date-time (t/with-offset-same-instant t offset))]
+    (sql-jdbc.execute/set-parameter driver ps i t)))
 
-      (timezone-id->offset-str \"US/Pacific\", date-time) ; -> \"-08:00\"
+;; MySQL TIMESTAMPS are actually TIMESTAMP WITH LOCAL TIME ZONE, i.e. they are stored normalized to UTC when stored.
+;; However, MySQL returns them in the report time zone in an effort to make our lives horrible.
+;;
+;; Check and see if the column type is `TIMESTAMP` (as opposed to `DATETIME`, which is the equivalent of
+;; LocalDateTime), and normalize it to a UTC timestamp if so.
+(defmethod sql-jdbc.execute/read-column [:mysql Types/TIMESTAMP]
+  [_ _ ^ResultSet rs ^ResultSetMetaData rsmeta ^Integer i]
+  (when-let [t (.getObject rs i LocalDateTime)]
+    (if (= (.getColumnTypeName rsmeta i) "TIMESTAMP")
+      (t/with-offset-same-instant (t/offset-date-time t (t/zone-id (qp.timezone/results-timezone-id))) (t/zone-offset 0))
+      t)))
 
-  Returns `nil` if `timezone-id` is itself `nil`. The `date-time` must be included as some timezones vary their
-  offsets at different times of the year (i.e. daylight savings time)."
-  [^String timezone-id date-time]
-  (when timezone-id
-    (time/unparse (.withZone timezone-offset-formatter (t/time-zone-for-id timezone-id)) date-time)))
+(defn- format-offset [t]
+  (let [offset (t/format "ZZZZZ" (t/zone-offset t))]
+    (if (= offset "Z")
+      "UTC"
+      offset)))
 
-(def ^:private ^TimeZone utc   (TimeZone/getTimeZone "UTC"))
-(def ^:private utc-hsql-offset (hx/literal "+00:00"))
+(defmethod unprepare/unprepare-value [:mysql OffsetTime]
+  [_ t]
+  ;; MySQL doesn't support timezone offsets in literals so pass in a local time literal wrapped in a call to convert
+  ;; it to the appropriate timezone
+  (format "convert_tz('%s', '%s', @@session.time_zone)"
+          (t/format "HH:mm:ss.SSS" t)
+          (format-offset t)))
 
-(s/defn ^:private create-hsql-for-date
-  "Returns an HoneySQL structure representing the date for MySQL. If there's a report timezone, we need to ensure the
-  timezone conversion is wrapped around the `date-literal-or-string`. It supports both an `hx/literal` and a plain
-  string depending on whether or not the date value should be emedded in the statement or separated as a prepared
-  statement parameter. Use a string for prepared statement values, a literal if you want it embedded in the statement"
-  [date-obj :- java.util.Date
-   date-literal-or-string :- (s/either s/Str Literal)]
-  (let [date-as-dt                 (tcoerce/from-date date-obj)
-        report-timezone-offset-str (timezone-id->offset-str (driver/report-timezone) date-as-dt)]
-    (if (and report-timezone-offset-str
-             (not (.hasSameRules utc (TimeZone/getTimeZone (driver/report-timezone)))))
-      ;; if we have a report timezone we want to generate SQL like convert_tz('2004-01-01T12:00:00','-8:00','-2:00')
-      ;; to convert our timestamp from the UTC timezone -> report timezone. Note `date-object-literal` is assumed to be
-      ;; in UTC as `du/format-date` is being used which defaults to UTC.
-      ;; See https://dev.mysql.com/doc/refman/5.7/en/date-and-time-functions.html#function_convert-tz
-      ;; (We're using raw offsets for the JVM/report timezone instead of the timezone ID because we can't be 100% sure that
-      ;; MySQL will accept either of our timezone IDs as valid.)
-      ;;
-      ;; Note there's a small chance that report timezone will never be set on the MySQL connection, if attempting to
-      ;; do so fails because the ID is valid; if the report timezone is different from the MySQL database's timezone,
-      ;; this will result in the `convert_tz()` call below being incorrect. Unfortunately we don't currently have a
-      ;; way to determine that setting a timezone has failed for the current query, since it actualy is attempted
-      ;; after the query is compiled. Hopefully situtations where that happens are rare; at any rate it's probably
-      ;; preferable to have timezones slightly wrong in these rare theoretical situations, instead of all the time, as
-      ;; was the previous behavior.
-      (hsql/call :convert_tz
-        date-literal-or-string
-        utc-hsql-offset
-        (hx/literal report-timezone-offset-str))
-      ;; otherwise if we don't have a report timezone we can continue to pass the object as-is, e.g. as a prepared
-      ;; statement param
-      date-obj)))
+(defmethod unprepare/unprepare-value [:mysql OffsetDateTime]
+  [_ t]
+  (format "convert_tz('%s', '%s', @@session.time_zone)"
+          (t/format "yyyy-MM-dd HH:mm:ss.SSS" t)
+          (format-offset t)))
 
-;; MySQL doesn't seem to correctly want to handle timestamps no matter how nicely we ask. SAD! Thus we will just
-;; convert them to appropriate timestamp literals and include functions to convert timezones as needed
-(defmethod sqlqp/->honeysql [MySQLDriver Date]
-  [_ date]
-  (create-hsql-for-date date (hx/literal (du/format-date :date-hour-minute-second-ms date))))
-
-;; The sqlqp/->honeysql entrypoint is used by MBQL, but native queries with field filters have the same issue. Below
-;; will return a map that will be used in the prepared statement to correctly convert and parameterize the date
-(s/defmethod sql/->prepared-substitution [MySQLDriver Date] :- sql/PreparedStatementSubstitution
-  [_ date]
-  (let [date-str (du/format-date :date-hour-minute-second-ms date)]
-    (sql/make-stmt-subs (-> (create-hsql-for-date date date-str)
-                            hx/->date
-                            (hsql/format :quoting (sql/quote-style (MySQLDriver.)))
-                            first)
-                        [date-str])))
-
-(defmethod sqlqp/->honeysql [MySQLDriver Time]
-  [_ time-value]
-  (hx/->time time-value))
-
-;; Since MySQL doesn't have date_trunc() we fake it by formatting a date to an appropriate string and then converting
-;; back to a date. See http://dev.mysql.com/doc/refman/5.6/en/date-and-time-functions.html#function_date-format for an
-;; explanation of format specifiers
-(defn- trunc-with-format [format-str expr]
-  (str-to-date format-str (date-format format-str expr)))
-
-(defn- date [unit expr]
-  (case unit
-    :default         expr
-    :minute          (trunc-with-format "%Y-%m-%d %H:%i" expr)
-    :minute-of-hour  (hx/minute expr)
-    :hour            (trunc-with-format "%Y-%m-%d %H" expr)
-    :hour-of-day     (hx/hour expr)
-    :day             (hsql/call :date expr)
-    :day-of-week     (hsql/call :dayofweek expr)
-    :day-of-month    (hsql/call :dayofmonth expr)
-    :day-of-year     (hsql/call :dayofyear expr)
-    ;; To convert a YEARWEEK (e.g. 201530) back to a date you need tell MySQL which day of the week to use,
-    ;; because otherwise as far as MySQL is concerned you could be talking about any of the days in that week
-    :week            (str-to-date "%X%V %W"
-                                  (hx/concat (hsql/call :yearweek expr)
-                                             (hx/literal " Sunday")))
-    ;; mode 6: Sunday is first day of week, first week of year is the first one with 4+ days
-    :week-of-year    (hx/inc (hx/week expr 6))
-    :month           (str-to-date "%Y-%m-%d"
-                                  (hx/concat (date-format "%Y-%m" expr)
-                                             (hx/literal "-01")))
-    :month-of-year   (hx/month expr)
-    ;; Truncating to a quarter is trickier since there aren't any format strings.
-    ;; See the explanation in the H2 driver, which does the same thing but with slightly different syntax.
-    :quarter         (str-to-date "%Y-%m-%d"
-                                  (hx/concat (hx/year expr)
-                                             (hx/literal "-")
-                                             (hx/- (hx/* (hx/quarter expr)
-                                                         3)
-                                                   2)
-                                             (hx/literal "-01")))
-    :quarter-of-year (hx/quarter expr)
-    :year            (hx/year expr)))
-
-(defn- date-interval [unit amount]
-  (hsql/call :date_add
-    :%now
-    (hsql/raw (format "INTERVAL %d %s" (int amount) (name unit)))))
-
-(defn- humanize-connection-error-message [message]
-  (condp re-matches message
-        #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$"
-        (driver/connection-error-messages :cannot-connect-check-host-and-port)
-
-        #"^Unknown database .*$"
-        (driver/connection-error-messages :database-name-incorrect)
-
-        #"Access denied for user.*$"
-        (driver/connection-error-messages :username-or-password-incorrect)
-
-        #"Must specify port after ':' in connection string"
-        (driver/connection-error-messages :invalid-hostname)
-
-        #".*" ; default
-        message))
-
-(defn- string-length-fn [field-key]
-  (hsql/call :char_length field-key))
-
-(def ^:private mysql-date-formatters
-  (concat (driver/create-db-time-formatters "yyyy-MM-dd HH:mm:ss.SSSSSS zzz")
-          ;;In some timezones, MySQL doesn't return a timezone description but rather a truncated offset, such as '-02'. That
-          ;;offset will fail to parse using a regular formatter
-          (driver/create-db-time-formatters "yyyy-MM-dd HH:mm:ss.SSSSSS Z")))
-
-(def ^:private mysql-db-time-query
-  "select CONCAT(DATE_FORMAT(current_timestamp, '%Y-%m-%d %H:%i:%S.%f' ), ' ', @@system_time_zone)")
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                        IDRIVER & ISQLDRIVER METHOD MAPS                                        |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(u/strict-extend MySQLDriver
-  driver/IDriver
-  (merge
-   (sql/IDriverSQLDefaultsMixin)
-   {:date-interval                     (u/drop-first-arg date-interval)
-    :details-fields                    (constantly (ssh/with-tunnel-config
-                                                     [driver/default-host-details
-                                                      (assoc driver/default-port-details :default 3306)
-                                                      driver/default-dbname-details
-                                                      driver/default-user-details
-                                                      driver/default-password-details
-                                                      (assoc driver/default-additional-options-details
-                                                        :placeholder  "tinyInt1isBit=false")]))
-    :humanize-connection-error-message (u/drop-first-arg humanize-connection-error-message)
-    :current-db-time                   (driver/make-current-db-time-fn mysql-db-time-query mysql-date-formatters)
-    :features                          (fn [this]
-                                         ;; MySQL LIKE clauses are case-sensitive or not based on whether the
-                                         ;; collation of the server and the columns themselves. Since this isn't
-                                         ;; something we can really change in the query itself don't present the
-                                         ;; option to the users in the UI
-                                         (conj (sql/features this) :no-case-sensitivity-string-filter-options))})
-
-  sql/ISQLDriver
-  (merge
-   (sql/ISQLDriverDefaultsMixin)
-   {:active-tables             sql/post-filtered-active-tables
-    :column->base-type         (u/drop-first-arg column->base-type)
-    :connection-details->spec  (u/drop-first-arg connection-details->spec)
-    :date                      (u/drop-first-arg date)
-    :excluded-schemas          (constantly #{"INFORMATION_SCHEMA"})
-    :quote-style               (constantly :mysql)
-    :string-length-fn          (u/drop-first-arg string-length-fn)
-    ;; If this fails you need to load the timezone definitions from your system into MySQL; run the command
-    ;; `mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql` See
-    ;; https://dev.mysql.com/doc/refman/5.7/en/time-zone-support.html for details
-    ;; TODO - This can also be set via `sessionVariables` in the connection string, if that's more useful (?)
-    :set-timezone-sql          (constantly "SET @@session.time_zone = %s;")
-    :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)}))
-
-(defn -init-driver
-  "Register the MySQL driver"
-  []
-  (driver/register-driver! :mysql (MySQLDriver.)))
+(defmethod unprepare/unprepare-value [:mysql ZonedDateTime]
+  [_ t]
+  (format "convert_tz('%s', '%s', @@session.time_zone)"
+          (t/format "yyyy-MM-dd HH:mm:ss.SSS" t)
+          (str (t/zone-id t))))

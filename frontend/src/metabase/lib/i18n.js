@@ -18,7 +18,7 @@ export function setLocalization(translationsObject) {
 
   addMsgIds(translationsObject);
 
-  // add and set locale with C-3PO
+  // add and set locale with ttag
   addLocale(locale, translationsObject);
   useLocale(locale);
 

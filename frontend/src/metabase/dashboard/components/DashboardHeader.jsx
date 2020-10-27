@@ -243,14 +243,6 @@ export default class DashboardHeader extends Component {
       );
     }
 
-    buttons.push(
-      <Tooltip tooltip="Present this dashboard">
-        <Link to={Urls.presentationStart(dashboard.id)}>
-          <Icon name="present" size={22} />
-        </Link>
-      </Tooltip>,
-    );
-
     if (isEditing) {
       // Parameters
       buttons.push(

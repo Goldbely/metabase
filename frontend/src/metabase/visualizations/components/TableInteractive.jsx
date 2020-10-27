@@ -3,6 +3,7 @@
 import React, { Component } from "react";
 import PropTypes from "prop-types";
 import ReactDOM from "react-dom";
+import ReactMarkdown from "react-markdown";
 import "./TableInteractive.css";
 
 import Icon from "metabase/components/Icon";
@@ -431,13 +432,13 @@ export default class TableInteractive extends Component {
     clicked: ?ClickObject,
   ) {
     try {
-      return formatValue(value, {
+      return <ReactMarkdown source={formatValue(value, {
         ...columnSettings,
         type: "cell",
         jsx: true,
         rich: true,
         clicked: clicked,
-      });
+      })} escapeHtml={false} />;
     } catch (e) {
       console.error(e);
     }

@@ -3,6 +3,7 @@
 import React, { Component } from "react";
 import PropTypes from "prop-types";
 import ReactDOM from "react-dom";
+import ReactMarkdown from "react-markdown";
 
 import styles from "./Table.css";
 
@@ -206,13 +207,13 @@ export default class TableSimple extends Component {
                             extent={getColumnExtent(cols, rows, columnIndex)}
                           />
                         ) : (
-                          formatValue(value, {
+                          <ReactMarkdown source={formatValue(value, {
                             ...columnSettings,
                             clicked: clicked,
                             type: "cell",
                             jsx: true,
                             rich: true,
-                          })
+                          })} escapeHtml={false} />
                         );
 
                       // $FlowFixMe: proper test for a React element?
@@ -232,6 +233,7 @@ export default class TableSimple extends Component {
                                 rowIndex,
                                 column.name,
                               ),
+                            height: '100%',
                           }}
                           className={cx(
                             "px1 border-bottom text-dark fullscreen-normal-text fullscreen-night-text text-bold",

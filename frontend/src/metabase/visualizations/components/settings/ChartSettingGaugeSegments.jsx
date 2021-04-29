@@ -1,4 +1,5 @@
-import React from 'react';
+/* eslint-disable react/prop-types */
+import React from "react";
 
 import { t } from "ttag";
 import _ from "underscore";
